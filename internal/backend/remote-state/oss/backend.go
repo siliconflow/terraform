@@ -27,6 +27,7 @@ import (
 	"github.com/aliyun/alibaba-cloud-sdk-go/services/sts"
 	"github.com/aliyun/aliyun-oss-go-sdk/oss"
 	"github.com/aliyun/aliyun-tablestore-go-sdk/tablestore"
+	aliyunCredentials "github.com/aliyun/credentials-go/credentials"
 	"github.com/hashicorp/go-cleanhttp"
 	"github.com/jmespath/go-jmespath"
 	"github.com/mitchellh/go-homedir"
@@ -263,6 +264,59 @@ func New() backend.Backend {
 					return nil, nil
 				},
 			},
+
+			// OIDC (RRSA / workload identity) authentication. When configured, the
+			// backend calls STS AssumeRoleWithOIDC via aliyun/credentials-go to
+			// obtain a temporary AK/SK/SecurityToken. No static access_key /
+			// secret_key is required. This is primarily used by ACK RRSA pods.
+			"oidc_provider_arn": {
+				Type:        schema.TypeString,
+				Optional:    true,
+				Description: "The ARN of the OIDC IdP. The backend calls STS AssumeRoleWithOIDC to obtain a temporary credential when this is set together with oidc_token_file_path.",
+				DefaultFunc: schema.MultiEnvDefaultFunc([]string{"ALICLOUD_OIDC_PROVIDER_ARN", "ALIBABA_CLOUD_OIDC_PROVIDER_ARN"}, ""),
+			},
+			"oidc_token_file_path": {
+				Type:        schema.TypeString,
+				Optional:    true,
+				Description: "The path of the OIDC token file, e.g. the projected service-account token mounted into an ACK RRSA pod.",
+				DefaultFunc: schema.MultiEnvDefaultFunc([]string{"ALICLOUD_OIDC_TOKEN_FILE", "ALIBABA_CLOUD_OIDC_TOKEN_FILE"}, ""),
+			},
+			"oidc_role_arn": {
+				Type:        schema.TypeString,
+				Optional:    true,
+				Description: "The ARN of the RAM role to assume via OIDC.",
+				DefaultFunc: schema.MultiEnvDefaultFunc([]string{"ALICLOUD_OIDC_ROLE_ARN", "ALIBABA_CLOUD_ROLE_ARN"}, ""),
+			},
+			"oidc_session_name": {
+				Type:        schema.TypeString,
+				Optional:    true,
+				Description: "The role session name to use when calling AssumeRoleWithOIDC. Defaults to `terraform`.",
+				DefaultFunc: schema.MultiEnvDefaultFunc([]string{"ALICLOUD_OIDC_ROLE_SESSION_NAME", "ALIBABA_CLOUD_ROLE_SESSION_NAME"}, ""),
+			},
+			"oidc_policy": {
+				Type:        schema.TypeString,
+				Optional:    true,
+				Description: "An optional policy used to limit the permissions of the assumed role during the OIDC session.",
+			},
+			"oidc_session_expiration": {
+				Type:        schema.TypeInt,
+				Optional:    true,
+				Description: "The validity period (in seconds) of the OIDC session. The session expires after this time and a subsequent `terraform init` is required to refresh it. Must be between 900 and 3600.",
+				ValidateFunc: func(v interface{}, k string) ([]string, []error) {
+					min := 900
+					max := 3600
+					value, ok := v.(int)
+					if !ok {
+						return nil, []error{fmt.Errorf("expected type of %s to be int", k)}
+					}
+
+					if value < min || value > max {
+						return nil, []error{fmt.Errorf("expected %s to be in the range (%d - %d), got %d", k, min, max, v)}
+					}
+
+					return nil, nil
+				},
+			},
 		},
 	}
 
@@ -372,12 +426,44 @@ func (b *Backend) configure(ctx context.Context) error {
 	}
 
 	if accessKey == "" {
-		ecsRoleName := getBackendConfig("ecs_role_name", "ram_role_name")
-		subAccessKeyId, subAccessKeySecret, subSecurityToken, err := getAuthCredentialByEcsRoleName(ecsRoleName)
-		if err != nil {
-			return err
+		// OIDC (RRSA / workload identity) takes priority over ECS RAM role
+		// when configured. It calls STS AssumeRoleWithOIDC via
+		// aliyun/credentials-go and needs no long-term access key.
+		oidcProviderArn := getBackendConfig("oidc_provider_arn", "oidc_provider_arn")
+		oidcTokenFilePath := getBackendConfig("oidc_token_file_path", "oidc_token_file")
+		if oidcProviderArn != "" && oidcTokenFilePath != "" {
+			oidcRoleArn := getBackendConfig("oidc_role_arn", "ram_role_arn")
+			oidcSessionName := getBackendConfig("oidc_session_name", "ram_session_name")
+			oidcPolicy := getBackendConfig("oidc_policy", "")
+			oidcSessionExpiration := d.Get("oidc_session_expiration").(int)
+			if oidcSessionExpiration == 0 {
+				if exp, pErr := getConfigFromProfile(d, "expired_seconds"); pErr == nil && exp != nil {
+					oidcSessionExpiration = (int)(exp.(float64))
+				}
+			}
+			if oidcSessionExpiration == 0 {
+				if v := os.Getenv("ALICLOUD_OIDC_ROLE_SESSION_EXPIRATION"); v != "" {
+					if expiredSeconds, aErr := strconv.Atoi(v); aErr == nil {
+						oidcSessionExpiration = expiredSeconds
+					}
+				}
+				if oidcSessionExpiration == 0 {
+					oidcSessionExpiration = 3600
+				}
+			}
+			subAccessKeyId, subAccessKeySecret, subSecurityToken, err := getOIDCCredential(oidcRoleArn, oidcProviderArn, oidcTokenFilePath, oidcSessionName, oidcPolicy, stsEndpoint, oidcSessionExpiration)
+			if err != nil {
+				return err
+			}
+			accessKey, secretKey, securityToken = subAccessKeyId, subAccessKeySecret, subSecurityToken
+		} else {
+			ecsRoleName := getBackendConfig("ecs_role_name", "ram_role_name")
+			subAccessKeyId, subAccessKeySecret, subSecurityToken, err := getAuthCredentialByEcsRoleName(ecsRoleName)
+			if err != nil {
+				return err
+			}
+			accessKey, secretKey, securityToken = subAccessKeyId, subAccessKeySecret, subSecurityToken
 		}
-		accessKey, secretKey, securityToken = subAccessKeyId, subAccessKeySecret, subSecurityToken
 	}
 
 	if roleArn != "" {
@@ -486,6 +572,50 @@ func getAssumeRoleAK(accessKey, secretKey, stsToken, region, roleArn, sessionNam
 		return "", "", "", err
 	}
 	return response.Credentials.AccessKeyId, response.Credentials.AccessKeySecret, response.Credentials.SecurityToken, nil
+}
+
+// getOIDCCredential obtains a temporary AK/SK/SecurityToken by calling STS
+// AssumeRoleWithOIDC via aliyun/credentials-go. No long-term access key is
+// required: the OIDC token file (typically the projected service-account
+// token mounted into an ACK RRSA pod) is exchanged for an STS credential.
+//
+// The credential is fetched once during configure(); like getAssumeRoleAK it
+// is not refreshed automatically. STS tokens default to 3600s, which covers
+// the typical terraform run; a subsequent `terraform init` refreshes it.
+func getOIDCCredential(roleArn, providerArn, tokenFilePath, sessionName, policy, stsEndpoint string, sessionExpiration int) (string, string, string, error) {
+	if sessionName == "" {
+		sessionName = "terraform"
+	}
+	if sessionExpiration == 0 {
+		sessionExpiration = 3600
+	}
+
+	config := new(aliyunCredentials.Config).
+		SetType("oidc_role_arn").
+		SetOIDCProviderArn(providerArn).
+		SetOIDCTokenFilePath(tokenFilePath).
+		SetRoleArn(roleArn).
+		SetRoleSessionName(sessionName).
+		SetRoleSessionExpiration(sessionExpiration)
+	if policy != "" {
+		config.SetPolicy(policy)
+	}
+	if stsEndpoint != "" {
+		config.SetSTSEndpoint(stsEndpoint)
+	}
+
+	provider, err := aliyunCredentials.NewCredential(config)
+	if err != nil {
+		return "", "", "", fmt.Errorf("building OIDC credential provider: %#v", err)
+	}
+	cred, err := provider.GetCredential()
+	if err != nil {
+		return "", "", "", fmt.Errorf("calling AssumeRoleWithOIDC: %#v", err)
+	}
+	if cred.AccessKeyId == nil || cred.AccessKeySecret == nil || cred.SecurityToken == nil {
+		return "", "", "", fmt.Errorf("AssumeRoleWithOIDC returned an incomplete credential")
+	}
+	return *cred.AccessKeyId, *cred.AccessKeySecret, *cred.SecurityToken, nil
 }
 
 func getSdkConfig() *sdk.Config {
@@ -622,12 +752,20 @@ func getConfigFromProfile(d *schema.ResourceData, ProfileKey string) (interface{
 			return "", nil
 		}
 	case "ram_role_arn", "ram_session_name":
-		if mode != "RamRoleArn" {
+		// Shared by RamRoleArn and OIDC profile modes.
+		if mode != "RamRoleArn" && mode != "OIDC" {
 			return "", nil
 		}
 	case "expired_seconds":
-		if mode != "RamRoleArn" {
+		// Shared by RamRoleArn and OIDC profile modes.
+		if mode != "RamRoleArn" && mode != "OIDC" {
 			return float64(0), nil
+		}
+	case "oidc_provider_arn", "oidc_token_file":
+		// Only valid in OIDC profile mode; gated to avoid leaking OIDC
+		// keys when the active profile uses a different mode.
+		if mode != "OIDC" {
+			return "", nil
 		}
 	}
 

@@ -145,6 +145,70 @@ func TestBackendConfigProfile(t *testing.T) {
 	}
 }
 
+// TestBackendConfigOIDCFields verifies the new oidc_* schema fields parse and
+// validate cleanly. It exercises only PrepareConfig and does not touch the
+// network, so it runs without TF_ACC.
+func TestBackendConfigOIDCFields(t *testing.T) {
+	cfg := hcl2shim.HCL2ValueFromConfigValue(map[string]interface{}{
+		"region":                    "cn-beijing",
+		"bucket":                    "terraform-backend-oss-test",
+		"prefix":                    "mystate",
+		"key":                       "first.tfstate",
+		"oidc_provider_arn":         "acs:ram::123456789012****:oidc-provider/test",
+		"oidc_token_file_path":      "/var/run/secrets/oidc/token",
+		"oidc_role_arn":             "acs:ram::123456789012****:role/test",
+		"oidc_session_name":         "terraform",
+		"oidc_policy":               `{"Version":"1"}`,
+		"oidc_session_expiration":   3600,
+	})
+	if _, results := New().PrepareConfig(cfg); results.HasErrors() {
+		t.Fatalf("unexpected config validation error: %v", results.Err())
+	}
+}
+
+// TestBackendConfigOIDCExpirationInvalid ensures oidc_session_expiration
+// rejects values outside the 900-3600 range, mirroring
+// assume_role_session_expiration validation.
+func TestBackendConfigOIDCExpirationInvalid(t *testing.T) {
+	for _, v := range []int{899, 3601} {
+		cfg := hcl2shim.HCL2ValueFromConfigValue(map[string]interface{}{
+			"region":                  "cn-beijing",
+			"bucket":                  "terraform-backend-oss-test",
+			"oidc_session_expiration": v,
+		})
+		_, results := New().PrepareConfig(cfg)
+		if !results.HasErrors() {
+			t.Fatalf("expected validation error for oidc_session_expiration=%d", v)
+		}
+	}
+}
+
+// TestGetOIDCCredentialBuildError verifies that getOIDCCredential surfaces
+// config-build errors from credentials-go (here: an empty role ARN) without
+// reaching the network. credentials-go's OIDC provider builder errors during
+// Build() before any HTTP call is made.
+func TestGetOIDCCredentialBuildError(t *testing.T) {
+	// Unset the env vars credentials-go would otherwise use as fallbacks, so
+	// the empty role ARN deterministically produces a build error.
+	for _, k := range []string{"ALIBABA_CLOUD_OIDC_TOKEN_FILE", "ALIBABA_CLOUD_OIDC_PROVIDER_ARN", "ALIBABA_CLOUD_ROLE_ARN"} {
+		old, had := os.LookupEnv(k)
+		os.Unsetenv(k)
+		if had {
+			defer os.Setenv(k, old)
+		}
+	}
+
+	_, _, _, err := getOIDCCredential(
+		"",                               // roleArn: empty -> build error
+		"acs:ram::123456789012****:oidc-provider/test",
+		"/var/run/secrets/oidc/token",
+		"terraform", "", "", 3600,
+	)
+	if err == nil {
+		t.Fatal("expected error when role ARN is empty, got nil")
+	}
+}
+
 func TestBackendConfig_invalidKey(t *testing.T) {
 	testACC(t)
 	cfg := hcl2shim.HCL2ValueFromConfigValue(map[string]interface{}{
