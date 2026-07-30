@@ -263,6 +263,55 @@ func New() backend.Backend {
 					return nil, nil
 				},
 			},
+
+			// === credentials-go SDK based authentication ===
+			// When use_credentials_go is true, the backend resolves credentials via the
+			// aliyun/credentials-go SDK instead of the traditional access_key/assume_role
+			// logic above. The credential_type field selects the concrete method; an empty
+			// value uses the credentials-go default provider chain.
+			"use_credentials_go": {
+				Type:        schema.TypeBool,
+				Optional:    true,
+				Default:     false,
+				DefaultFunc: schema.EnvDefaultFunc("ALICLOUD_USE_CREDENTIALS_GO", false),
+				Description: "Enable authentication via the aliyun/credentials-go SDK. When false (default) the traditional access_key / assume_role logic is used; when true, credential_type selects the concrete method and an empty credential_type uses the credentials-go default provider chain.",
+			},
+			"credential_type": {
+				Type:        schema.TypeString,
+				Optional:    true,
+				DefaultFunc: schema.EnvDefaultFunc("ALICLOUD_CREDENTIAL_TYPE", ""),
+				Description: "Selects the credentials-go credential method. One of access_key, sts, ecs_ram_role, ram_role_arn, oidc_role_arn, credentials_uri. Empty value uses the credentials-go default provider chain. Only effective when use_credentials_go is true.",
+			},
+			"oidc_provider_arn": {
+				Type:        schema.TypeString,
+				Optional:    true,
+				DefaultFunc: schema.EnvDefaultFunc("ALIBABA_CLOUD_OIDC_PROVIDER_ARN", ""),
+				Description: "The ARN of the OIDC IdP. Required by credential_type=oidc_role_arn when use_credentials_go is true.",
+			},
+			"oidc_token_file_path": {
+				Type:        schema.TypeString,
+				Optional:    true,
+				DefaultFunc: schema.EnvDefaultFunc("ALIBABA_CLOUD_OIDC_TOKEN_FILE", ""),
+				Description: "The path of the OIDC token file. Required by credential_type=oidc_role_arn when use_credentials_go is true.",
+			},
+			"external_id": {
+				Type:        schema.TypeString,
+				Optional:    true,
+				Description: "The external id used to prevent the confused deputy problem. Optional for credential_type=ram_role_arn when use_credentials_go is true.",
+			},
+			"credentials_uri": {
+				Type:        schema.TypeString,
+				Optional:    true,
+				DefaultFunc: schema.EnvDefaultFunc("ALIBABA_CLOUD_CREDENTIALS_URI", ""),
+				Description: "The URI used to get temporary credentials. Required by credential_type=credentials_uri when use_credentials_go is true. Can also be sourced from the ALIBABA_CLOUD_CREDENTIALS_URI environment variable.",
+			},
+			"disable_imds_v1": {
+				Type:        schema.TypeBool,
+				Optional:    true,
+				Default:     false,
+				DefaultFunc: schema.EnvDefaultFunc("ALIBABA_CLOUD_IMDSV1_DISABLED", false),
+				Description: "Whether to disable IMDSv1 when using credential_type=ecs_ram_role with credentials-go.",
+			},
 		},
 	}
 
@@ -371,21 +420,33 @@ func (b *Backend) configure(ctx context.Context) error {
 		}
 	}
 
-	if accessKey == "" {
-		ecsRoleName := getBackendConfig("ecs_role_name", "ram_role_name")
-		subAccessKeyId, subAccessKeySecret, subSecurityToken, err := getAuthCredentialByEcsRoleName(ecsRoleName)
+	if d.Get("use_credentials_go").(bool) {
+		// Resolve credentials via the aliyun/credentials-go SDK. The region field is
+		// still consumed by the existing endpoint / OTS resolution code below, and
+		// ram_role_arn / ecs_ram_role are handled internally by the SDK, so the
+		// traditional assume_role / ecs_role_name branches are skipped.
+		ak, sk, token, err := getCredentialsFromCredentialsGo(d)
 		if err != nil {
 			return err
 		}
-		accessKey, secretKey, securityToken = subAccessKeyId, subAccessKeySecret, subSecurityToken
-	}
+		accessKey, secretKey, securityToken = ak, sk, token
+	} else {
+		if accessKey == "" {
+			ecsRoleName := getBackendConfig("ecs_role_name", "ram_role_name")
+			subAccessKeyId, subAccessKeySecret, subSecurityToken, err := getAuthCredentialByEcsRoleName(ecsRoleName)
+			if err != nil {
+				return err
+			}
+			accessKey, secretKey, securityToken = subAccessKeyId, subAccessKeySecret, subSecurityToken
+		}
 
-	if roleArn != "" {
-		subAccessKeyId, subAccessKeySecret, subSecurityToken, err := getAssumeRoleAK(accessKey, secretKey, securityToken, region, roleArn, sessionName, policy, stsEndpoint, sessionExpiration)
-		if err != nil {
-			return err
+		if roleArn != "" {
+			subAccessKeyId, subAccessKeySecret, subSecurityToken, err := getAssumeRoleAK(accessKey, secretKey, securityToken, region, roleArn, sessionName, policy, stsEndpoint, sessionExpiration)
+			if err != nil {
+				return err
+			}
+			accessKey, secretKey, securityToken = subAccessKeyId, subAccessKeySecret, subSecurityToken
 		}
-		accessKey, secretKey, securityToken = subAccessKeyId, subAccessKeySecret, subSecurityToken
 	}
 
 	if endpoint == "" {
