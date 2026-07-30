@@ -87,6 +87,134 @@ func deprecatedAssumeRoleSchema() *schema.Schema {
 	}
 }
 
+// credentialsBlockSchema defines the optional `credentials` block. When the block
+// is present in the backend configuration, the backend authenticates via the
+// aliyun/credentials-go SDK using the block's fields instead of the traditional
+// access_key / assume_role logic. An empty `credentials {}` block falls back to
+// the credentials-go default provider chain (env vars -> OIDC -> ~/.aliyun/config.json
+// -> ~/.alibabacloud/credentials -> ECS metadata -> credentials URI).
+//
+// Inner fields keep their environment-variable defaults (matching the semantics of the
+// former top-level credentials-go fields) so that env-var-only usage still works once
+// the block is declared. Note: a Schema may not set both `Default` and `DefaultFunc`
+// for scalar types (Default takes precedence and silently disables DefaultFunc), so
+// the boolean disable_imds_v1 field only sets DefaultFunc to keep its env var working.
+func credentialsBlockSchema() *schema.Schema {
+	return &schema.Schema{
+		Type:     schema.TypeList,
+		Optional: true,
+		MaxItems: 1,
+		Description: "When present, the backend authenticates via the aliyun/credentials-go SDK using the " +
+			"configuration in this block instead of the traditional access_key / assume_role logic. " +
+			"An empty `credentials {}` block uses the credentials-go default provider chain.",
+		Elem: &schema.Resource{
+			Schema: map[string]*schema.Schema{
+				"credential_type": {
+					Type:        schema.TypeString,
+					Optional:    true,
+					DefaultFunc: schema.EnvDefaultFunc("ALICLOUD_CREDENTIAL_TYPE", ""),
+					Description: "Selects the credentials-go credential method. One of access_key, sts, ecs_ram_role, ram_role_arn, oidc_role_arn, credentials_uri. Empty value uses the credentials-go default provider chain.",
+				},
+				"access_key": {
+					Type:        schema.TypeString,
+					Optional:    true,
+					Description: "Alibaba Cloud Access Key ID",
+					DefaultFunc: schema.MultiEnvDefaultFunc([]string{"ALICLOUD_ACCESS_KEY", "ALIBABA_CLOUD_ACCESS_KEY_ID", "ALICLOUD_ACCESS_KEY_ID"}, ""),
+				},
+				"secret_key": {
+					Type:        schema.TypeString,
+					Optional:    true,
+					Description: "Alibaba Cloud Access Secret Key",
+					DefaultFunc: schema.MultiEnvDefaultFunc([]string{"ALICLOUD_SECRET_KEY", "ALIBABA_CLOUD_ACCESS_KEY_SECRET", "ALICLOUD_ACCESS_KEY_SECRET"}, ""),
+				},
+				"security_token": {
+					Type:        schema.TypeString,
+					Optional:    true,
+					Description: "Alibaba Cloud Security Token",
+					DefaultFunc: schema.MultiEnvDefaultFunc([]string{"ALICLOUD_SECURITY_TOKEN", "ALIBABA_CLOUD_SECURITY_TOKEN"}, ""),
+				},
+				"ecs_role_name": {
+					Type:        schema.TypeString,
+					Optional:    true,
+					DefaultFunc: schema.MultiEnvDefaultFunc([]string{"ALICLOUD_ECS_ROLE_NAME", "ALIBABA_CLOUD_ECS_METADATA"}, ""),
+					Description: "The RAM Role Name attached on a ECS instance for API operations. You can retrieve this from the 'Access Control' section of the Alibaba Cloud console.",
+				},
+				"assume_role_role_arn": {
+					Type:        schema.TypeString,
+					Optional:    true,
+					Description: "The ARN of a RAM role to assume prior to making API calls.",
+					DefaultFunc: schema.MultiEnvDefaultFunc([]string{"ALICLOUD_ASSUME_ROLE_ARN", "ALIBABA_CLOUD_ROLE_ARN"}, ""),
+				},
+				"assume_role_session_name": {
+					Type:        schema.TypeString,
+					Optional:    true,
+					Description: "The session name to use when assuming the role.",
+					DefaultFunc: schema.MultiEnvDefaultFunc([]string{"ALICLOUD_ASSUME_ROLE_SESSION_NAME", "ALIBABA_CLOUD_ROLE_SESSION_NAME"}, ""),
+				},
+				"assume_role_policy": {
+					Type:        schema.TypeString,
+					Optional:    true,
+					Description: "The permissions applied when assuming a role. You cannot use this policy to grant permissions which exceed those of the role that is being assumed.",
+				},
+				"assume_role_session_expiration": {
+					Type:        schema.TypeInt,
+					Optional:    true,
+					Description: "The time after which the established session for assuming role expires.",
+					ValidateFunc: func(v interface{}, k string) ([]string, []error) {
+						min := 900
+						max := 3600
+						value, ok := v.(int)
+						if !ok {
+							return nil, []error{fmt.Errorf("expected type of %s to be int", k)}
+						}
+
+						if value < min || value > max {
+							return nil, []error{fmt.Errorf("expected %s to be in the range (%d - %d), got %d", k, min, max, v)}
+						}
+
+						return nil, nil
+					},
+				},
+				"oidc_provider_arn": {
+					Type:        schema.TypeString,
+					Optional:    true,
+					DefaultFunc: schema.EnvDefaultFunc("ALIBABA_CLOUD_OIDC_PROVIDER_ARN", ""),
+					Description: "The ARN of the OIDC IdP. Required by credential_type=oidc_role_arn.",
+				},
+				"oidc_token_file_path": {
+					Type:        schema.TypeString,
+					Optional:    true,
+					DefaultFunc: schema.EnvDefaultFunc("ALIBABA_CLOUD_OIDC_TOKEN_FILE", ""),
+					Description: "The path of the OIDC token file. Required by credential_type=oidc_role_arn.",
+				},
+				"external_id": {
+					Type:        schema.TypeString,
+					Optional:    true,
+					Description: "The external id used to prevent the confused deputy problem. Optional for credential_type=ram_role_arn.",
+				},
+				"credentials_uri": {
+					Type:        schema.TypeString,
+					Optional:    true,
+					DefaultFunc: schema.EnvDefaultFunc("ALIBABA_CLOUD_CREDENTIALS_URI", ""),
+					Description: "The URI used to get temporary credentials. Required by credential_type=credentials_uri. Can also be sourced from the ALIBABA_CLOUD_CREDENTIALS_URI environment variable.",
+				},
+				"disable_imds_v1": {
+					Type:        schema.TypeBool,
+					Optional:    true,
+					DefaultFunc: schema.EnvDefaultFunc("ALIBABA_CLOUD_IMDSV1_DISABLED", false),
+					Description: "Whether to disable IMDSv1 when using credential_type=ecs_ram_role.",
+				},
+				"sts_endpoint": {
+					Type:        schema.TypeString,
+					Optional:    true,
+					Description: "A custom endpoint for the STS API",
+					DefaultFunc: schema.MultiEnvDefaultFunc([]string{"ALICLOUD_STS_ENDPOINT", "ALIBABA_CLOUD_STS_ENDPOINT"}, ""),
+				},
+			},
+		},
+	}
+}
+
 // New creates a new backend for OSS remote state.
 func New() backend.Backend {
 	s := &schema.Backend{
@@ -265,53 +393,12 @@ func New() backend.Backend {
 			},
 
 			// === credentials-go SDK based authentication ===
-			// When use_credentials_go is true, the backend resolves credentials via the
-			// aliyun/credentials-go SDK instead of the traditional access_key/assume_role
-			// logic above. The credential_type field selects the concrete method; an empty
-			// value uses the credentials-go default provider chain.
-			"use_credentials_go": {
-				Type:        schema.TypeBool,
-				Optional:    true,
-				Default:     false,
-				DefaultFunc: schema.EnvDefaultFunc("ALICLOUD_USE_CREDENTIALS_GO", false),
-				Description: "Enable authentication via the aliyun/credentials-go SDK. When false (default) the traditional access_key / assume_role logic is used; when true, credential_type selects the concrete method and an empty credential_type uses the credentials-go default provider chain.",
-			},
-			"credential_type": {
-				Type:        schema.TypeString,
-				Optional:    true,
-				DefaultFunc: schema.EnvDefaultFunc("ALICLOUD_CREDENTIAL_TYPE", ""),
-				Description: "Selects the credentials-go credential method. One of access_key, sts, ecs_ram_role, ram_role_arn, oidc_role_arn, credentials_uri. Empty value uses the credentials-go default provider chain. Only effective when use_credentials_go is true.",
-			},
-			"oidc_provider_arn": {
-				Type:        schema.TypeString,
-				Optional:    true,
-				DefaultFunc: schema.EnvDefaultFunc("ALIBABA_CLOUD_OIDC_PROVIDER_ARN", ""),
-				Description: "The ARN of the OIDC IdP. Required by credential_type=oidc_role_arn when use_credentials_go is true.",
-			},
-			"oidc_token_file_path": {
-				Type:        schema.TypeString,
-				Optional:    true,
-				DefaultFunc: schema.EnvDefaultFunc("ALIBABA_CLOUD_OIDC_TOKEN_FILE", ""),
-				Description: "The path of the OIDC token file. Required by credential_type=oidc_role_arn when use_credentials_go is true.",
-			},
-			"external_id": {
-				Type:        schema.TypeString,
-				Optional:    true,
-				Description: "The external id used to prevent the confused deputy problem. Optional for credential_type=ram_role_arn when use_credentials_go is true.",
-			},
-			"credentials_uri": {
-				Type:        schema.TypeString,
-				Optional:    true,
-				DefaultFunc: schema.EnvDefaultFunc("ALIBABA_CLOUD_CREDENTIALS_URI", ""),
-				Description: "The URI used to get temporary credentials. Required by credential_type=credentials_uri when use_credentials_go is true. Can also be sourced from the ALIBABA_CLOUD_CREDENTIALS_URI environment variable.",
-			},
-			"disable_imds_v1": {
-				Type:        schema.TypeBool,
-				Optional:    true,
-				Default:     false,
-				DefaultFunc: schema.EnvDefaultFunc("ALIBABA_CLOUD_IMDSV1_DISABLED", false),
-				Description: "Whether to disable IMDSv1 when using credential_type=ecs_ram_role with credentials-go.",
-			},
+			// When a `credentials` block is present, the backend resolves credentials via
+			// the aliyun/credentials-go SDK using the block's configuration, instead of the
+			// traditional access_key / assume_role logic above. An empty `credentials {}`
+			// block uses the credentials-go default provider chain. credential_type selects
+			// the concrete method.
+			"credentials": credentialsBlockSchema(),
 		},
 	}
 
@@ -420,12 +507,14 @@ func (b *Backend) configure(ctx context.Context) error {
 		}
 	}
 
-	if d.Get("use_credentials_go").(bool) {
-		// Resolve credentials via the aliyun/credentials-go SDK. The region field is
-		// still consumed by the existing endpoint / OTS resolution code below, and
-		// ram_role_arn / ecs_ram_role are handled internally by the SDK, so the
-		// traditional assume_role / ecs_role_name branches are skipped.
-		ak, sk, token, err := getCredentialsFromCredentialsGo(d)
+	if v, ok := d.GetOk("credentials"); ok && len(v.([]interface{})) > 0 {
+		// A `credentials` block is present: resolve credentials via the aliyun/credentials-go
+		// SDK using the block's configuration. The region field is still consumed by the
+		// existing endpoint / OTS resolution code below, and ram_role_arn / ecs_ram_role are
+		// handled internally by the SDK, so the traditional assume_role / ecs_role_name
+		// branches are skipped.
+		credCfg := v.([]interface{})[0].(map[string]interface{})
+		ak, sk, token, err := getCredentialsFromCredentialsGo(credCfg)
 		if err != nil {
 			return err
 		}
